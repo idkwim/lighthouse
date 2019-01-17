@@ -1,431 +1,295 @@
-import idaapi
+import os
 import logging
-from lighthouse.util import *
+import weakref
 
-from operator import itemgetter, attrgetter
+from lighthouse.util.qt import *
+from lighthouse.util.misc import plugin_resource
+from lighthouse.util.disassembler import disassembler, DockableWindow
+from lighthouse.composer import ComposingShell
+from lighthouse.ui.coverage_table import CoverageTableView, CoverageTableModel, CoverageTableController
+from lighthouse.ui.coverage_combobox import CoverageComboBox
+from lighthouse.ui.coverage_settings import TableSettingsMenu
 
 logger = logging.getLogger("Lighthouse.UI.Overview")
-
-#------------------------------------------------------------------------------
-# Coverage Data Proxy Model
-#------------------------------------------------------------------------------
-
-# declare named constants for coverage table column indexes
-COV_PERCENT  = 0
-FUNC_NAME    = 1
-FUNC_ADDR    = 2
-BASIC_BLOCKS = 3
-BRANCHES     = 4
-LINES        = 5
-FINAL_COLUMN = 7
-
-# column -> field name mapping
-COLUMN_TO_FIELD = \
-{
-    COV_PERCENT:  "percent_instruction",
-    FUNC_NAME:    "name",
-    FUNC_ADDR:    "address",
-    BASIC_BLOCKS: "node_count",
-}
-
-class CoverageModel(QtCore.QAbstractItemModel):
-    """
-    A Qt model interface to format coverage data for Qt views.
-    """
-
-    def __init__(self, db_coverage, parent=None):
-        super(CoverageModel, self).__init__(parent)
-        self._db_coverage = None
-
-        # a map to correlate a given row in the table to the function coverage
-        self.row2func = {}
-        self._rows = 0
-
-        # headers of the table
-        self._column_headers = \
-        {
-            COV_PERCENT:  "Coverage %",
-            FUNC_NAME:    "Function Name",
-            FUNC_ADDR:    "Address",
-            BASIC_BLOCKS: "Basic Blocks",
-            BRANCHES:     "Branches",
-            LINES:        "Lines",
-            FINAL_COLUMN: ""            # NOTE: stretch section, left blank for now
-        }
-
-        # used to make the model aware of its last sort state
-        self._last_sort = FUNC_ADDR
-        self._last_sort_order = QtCore.Qt.AscendingOrder
-
-        # used by the model to determine whether it should display 0% coverage entries
-        self._hide_zero = False
-
-        # update the model with the given coverage data
-        self.update_model(db_coverage)
-
-    #--------------------------------------------------------------------------
-    # AbstractItemModel Overloads
-    #--------------------------------------------------------------------------
-
-    def flags(self, index):
-        return QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsSelectable
-
-    def parent(self, index=QtCore.QModelIndex):
-        return QtCore.QModelIndex()
-
-    def index(self, row, column, parent=QtCore.QModelIndex()):
-        try:
-            return self.createIndex(row, column, self.row2func[row])
-        except KeyError as e:
-            return QtCore.QModelIndex()
-
-    def canFetchMore(self, index):
-        return True
-
-    def rowCount(self, index=QtCore.QModelIndex()):
-        """
-        Return the number of rows in the model.
-        """
-        return self._rows
-
-    def columnCount(self, index=QtCore.QModelIndex()):
-        """
-        Return the number of columns in the model.
-        """
-        return len(self._column_headers)
-
-    def headerData(self, column, orientation, role=QtCore.Qt.DisplayRole):
-        """
-        Define the properties of how the table header should be displayed.
-        """
-
-        if orientation == QtCore.Qt.Horizontal:
-
-            # the title of the header columns has been requested
-            if role == QtCore.Qt.DisplayRole:
-                try:
-                    return self._column_headers[column]
-                except KeyError as e:
-                    pass
-
-            # the text alignment of the header has beeen requested
-            elif role == QtCore.Qt.TextAlignmentRole:
-
-                # center align all columns
-                return QtCore.Qt.AlignHCenter
-
-        # unhandeled header request
-        return None
-
-    def data(self, index, role=QtCore.Qt.DisplayRole):
-        """
-        Define how Qt should access the underlying model data.
-        """
-
-        if not index.isValid():
-            return None
-
-        # ensure the row requested exists
-        if not (0 <= index.row() < self._rows):
-            return None
-
-        # text alignment request
-        if role == QtCore.Qt.TextAlignmentRole:
-
-            # we want to align the first column left
-            #if index.column() == 0:
-            #    return QtCore.Qt.AlignVCenter
-
-            # center align all other columns
-            return QtCore.Qt.AlignCenter
-
-        # data display request
-        elif role == QtCore.Qt.DisplayRole:
-
-            # lookup the func coverage object for this row
-            func_coverage = self.row2func[index.row()]
-
-            # Coverage % - (by instruction execution)
-            if index.column() == COV_PERCENT:
-                return "%.2f%%" % (func_coverage.insn_percent*100)
-
-            # Function Name
-            elif index.column() == FUNC_NAME:
-                return func_coverage.name
-
-            # Function Address
-            elif index.column() == FUNC_ADDR:
-                return "0x%08X" % func_coverage.address
-
-            # Basic Blocks
-            elif index.column() == BASIC_BLOCKS:
-                return "%u / %u" % (func_coverage.exec_node_count,
-                                    func_coverage.node_count)
-
-            # Branches
-            elif index.column() == BRANCHES:
-                return "TODO"
-
-            # Source Lines
-            elif index.column() == LINES:
-                return "TODO"
-
-        # cell background color request
-        elif role == QtCore.Qt.BackgroundRole:
-            func_coverage = self.row2func[index.row()]
-            return func_coverage.coverage_color
-
-        # font color request
-        elif role == QtCore.Qt.ForegroundRole:
-            return QtGui.QColor(QtCore.Qt.white)
-
-        return None
-
-    def sort(self, column, sort_order):
-        """
-        Sort coverage data model by column.
-        """
-
-        #
-        # look up the name of field in the FunctionCoverage class object
-        # that we would like to sort by based on the selected column
-        #
-
-        try:
-            sort_field = COLUMN_TO_FIELD[column]
-        except KeyError as e:
-            logger.warning("TODO: implement column %u sorting" % column)
-            return False
-
-        #
-        # sort the existing entries in the table by the selected field name
-        #
-        # NOTE:
-        #   using attrgetter appears to profile ~8-12% faster than lambdas
-        #   accessing the member on the member, hence the strange paradigm
-        #
-
-        sorted_functions = sorted(
-            self.row2func.itervalues(), # row2func has the 'existing' entries
-            key=attrgetter(sort_field),
-            reverse=sort_order
-        )
-
-        # finally, rebuild the row2func mapping
-        self.layoutAboutToBeChanged.emit()
-        self.row2func = dict(zip(xrange(len(sorted_functions)), sorted_functions))
-        self.layoutChanged.emit()
-
-        # save this as the most recent sort type
-        self._last_sort = column
-        self._last_sort_order = sort_order
-        return True
-
-    #--------------------------------------------------------------------------
-    # Model Controls
-    #--------------------------------------------------------------------------
-
-    def hide_zero_coverage(self, hide=True):
-        """
-        Toggle zero coverage entries as visible.
-        """
-
-        # state change matches current state, nothing to do
-        if self._hide_zero == hide:
-            return
-
-        # rebuild the row map, using the new state (hide/unhide 0% items)
-        self._hide_zero = hide
-        self._init_row2func_map()
-
-        # emit a layout changed signal if the sort attempt did not
-        if not self.sort(self._last_sort, self._last_sort_order):
-            self.layoutChanged()
-
-    def update_model(self, db_coverage):
-        """
-        Replace the underlying data source and re-generate model mappings.
-        """
-        self._db_coverage = db_coverage
-
-        # initialize a new row2func map as the coverage data has changed
-        self._init_row2func_map()
-
-        # let consumers know that we have updated the model
-        self.layoutChanged.emit()
-
-    def _init_row2func_map(self):
-        """
-        Initialize the mapping to go from displayed row to function.
-        """
-        row = 0
-        self.row2func = {}
-
-        # no coverage, nothing else to do
-        if not self._db_coverage:
-            return
-
-        functions = self._db_coverage.functions.itervalues()
-
-        # only map items with a non-zero coverage as visible
-        if self._hide_zero:
-            for func_coverage in functions:
-                if func_coverage.percent_instruction:
-                    self.row2func[row] = func_coverage
-                    row += 1
-
-        #
-        # map all items as visible. faster to have this loop seperate from
-        # the above so that we don't have to check a conditional every
-        # iteration when not in use
-        #
-
-        else:
-            for func_coverage in self._db_coverage.functions.itervalues():
-                self.row2func[row] = func_coverage
-                row += 1
-
-        self._rows = len(self.row2func)
 
 #------------------------------------------------------------------------------
 # Coverage Overview
 #------------------------------------------------------------------------------
 
-class CoverageOverview(idaapi.PluginForm):
+class CoverageOverview(DockableWindow):
     """
-    The Coverage Overview Qt Widget.
-
-    TODO
+    The Coverage Overview Widget.
     """
 
-    def __init__(self, db_coverage):
-        super(CoverageOverview, self).__init__()
-        self._title = "Coverage Overview"
-        self._model = CoverageModel(db_coverage)
+    def __init__(self, core):
+        super(CoverageOverview, self).__init__(
+            "Coverage Overview",
+            plugin_resource(os.path.join("icons", "overview.png"))
+        )
+        self._core = core
+        self._visible = False
 
-    def Show(self):
+        # see the EventProxy class below for more details
+        self._events = EventProxy(self)
+        self._widget.installEventFilter(self._events)
+
+        # initialize the plugin UI
+        self._ui_init()
+
+        # refresh the data UI such that it reflects the most recent data
+        self.refresh()
+
+    #--------------------------------------------------------------------------
+    # Pseudo Widget Functions
+    #--------------------------------------------------------------------------
+
+    def show(self):
         """
-        Show the dialog.
+        Show the CoverageOverview UI / widget.
         """
-        return super(CoverageOverview, self).Show(
-            self._title,
-            options=idaapi.PluginForm.FORM_PERSIST
+        self.refresh()
+        super(CoverageOverview, self).show()
+        self._visible = True
+
+        #
+        # if no metadata had been collected prior to showing the coverage
+        # overview (eg, through loading coverage), we should do that now
+        # before the user can interact with the view...
+        #
+
+        if not self._core.director.metadata.cached:
+            self._table_controller.refresh_metadata()
+
+    def terminate(self):
+        """
+        The CoverageOverview is being hidden / deleted.
+        """
+        self._visible = False
+        self._combobox = None
+        self._shell = None
+        self._table_view = None
+        self._table_controller = None
+        self._table_model = None
+        self._widget = None
+
+    def isVisible(self):
+        return self._visible
+
+    #--------------------------------------------------------------------------
+    # Initialization - UI
+    #--------------------------------------------------------------------------
+
+    def _ui_init(self):
+        """
+        Initialize UI elements.
+        """
+
+        # initialize our ui elements
+        self._ui_init_table()
+        self._ui_init_toolbar()
+        self._ui_init_signals()
+
+        # layout the populated ui just before showing it
+        self._ui_layout()
+
+    def _ui_init_table(self):
+        """
+        Initialize the coverage table.
+        """
+        self._table_model = CoverageTableModel(self._core.director, self._widget)
+        self._table_controller = CoverageTableController(self._table_model)
+        self._table_view = CoverageTableView(
+            self._table_controller,
+            self._table_model,
+            self._widget
         )
 
-    def OnCreate(self, form):
+    def _ui_init_toolbar(self):
         """
-        Called when the view is created.
+        Initialize the coverage toolbar.
         """
 
-        # NOTE/COMPAT
-        if using_pyqt5():
-            self.parent = self.FormToPyQtWidget(form)
-        else:
-            self.parent = self.FormToPySideWidget(form)
-
-        # set window icon to the coverage overview icon
-        self.parent.setWindowIcon(QtGui.QIcon(resource_file("icons\overview.png")))
+        # initialize child elements to go on the toolbar
+        self._ui_init_toolbar_elements()
+        self._ui_init_settings()
 
         #
-        # coverage list table
+        # create the 'toolbar', and customize its style. specifically, we are
+        # interested in tweaking the separator and padding between elements.
         #
 
-        self.table = QtWidgets.QTreeView()
-        self.table.setRootIsDecorated(False)
-        self.table.setUniformRowHeights(True)
-        self.table.setExpandsOnDoubleClick(False)
+        self._toolbar = QtWidgets.QToolBar()
+        self._toolbar.setStyle(QtWidgets.QStyleFactory.create("Windows"))
+        self._toolbar.setStyleSheet('QToolBar{padding:0;margin:0;}')
 
-        # enable sorting on the table, default to sort by func address
-        self.table.setSortingEnabled(True)
-        self.table.header().setSortIndicator(FUNC_ADDR, QtCore.Qt.AscendingOrder)
+        # populate the toolbar with all our subordinates
+        self._toolbar.addWidget(self._shell_elements)
+        self._toolbar.addWidget(self._settings_button)
 
-        # install a drawing delegate to draw the grid lines on the list view
-        delegate = GridDelegate(self.table)
-        self.table.setItemDelegate(delegate)
+    def _ui_init_toolbar_elements(self):
+        """
+        Initialize the coverage toolbar UI elements.
+        """
 
-        # install the data source for the list view
-        self.table.setModel(self._model)
+        # the composing shell
+        self._shell = ComposingShell(
+            self._core.director,
+            weakref.proxy(self._table_model),
+            weakref.proxy(self._table_view)
+        )
 
-        #
-        # coverage list toolbar (& members)
-        #
+        # the coverage combobox
+        self._combobox = CoverageComboBox(self._core.director)
 
-        self.toolbar = QtWidgets.QToolBar()
+        # the splitter to make the shell / combobox resizable
+        self._shell_elements = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        self._shell_elements.setStyleSheet(
+        """
+        QSplitter::handle
+        {
+            background-color: #909090;
+            width: 2px;
+            height: 2px;
+            margin: 0 0.5em 0 0.5em
+        }
 
-        # checkbox to hide 0% coverage entries
-        self.hide_zero_label    = QtWidgets.QLabel(" Hide 0% Coverage: ")
-        self.hide_zero_checkbox = QtWidgets.QCheckBox()
+        QSplitter::handle:horizontal:hover
+        {
+            background-color: #3399FF;
+        }
+        """)
 
-        # populate the toolbar
-        self.toolbar.addWidget(self.hide_zero_label)
-        self.toolbar.addWidget(self.hide_zero_checkbox)
+        # add the child items we wish to put the 'splitter' between
+        # [ composing shell            ] [SPLITTER] [ combobox ]
+        self._shell_elements.addWidget(self._shell)
+        self._shell_elements.addWidget(self._combobox)
 
-        #
-        # ui signals
-        #
+        # make the splitter responsive (animate) when hovered
+        self._shell_elements.handle(1).setAttribute(QtCore.Qt.WA_Hover)
 
-        # connect a signal to jump to the function disas described by a row
-        self.table.doubleClicked.connect(self._ui_entry_double_click)
-        #self.table.setContextMenuPolicy(Qt.CustomContextMenu)
-        #self.table.customContextMenuRequested.connect(...)
-        self.hide_zero_checkbox.stateChanged.connect(self._ui_hide_zero_toggle)
+        # give the shell expansion preference over the combobox
+        self._shell_elements.setStretchFactor(0, 1)
 
-        #
-        # ui layout
-        #
+    def _ui_init_settings(self):
+        """
+        Initialize the overview settings popup.
+        """
 
+        # settings button
+        self._settings_button = QtWidgets.QToolButton()
+        self._settings_button.setIcon(get_qt_icon("SP_DialogResetButton"))
+        self._settings_button.setStyleSheet("QToolButton::menu-indicator{image: none;}")
+
+        # settings menu
+        self._settings_menu = TableSettingsMenu(self._widget)
+
+    def _ui_init_signals(self):
+        """
+        Connect UI signals.
+        """
+        self._settings_menu.connect_signals(self._table_controller, self._core)
+        self._settings_button.clicked.connect(self._ui_show_settings)
+
+    def _ui_layout(self):
+        """
+        Layout the major UI elements of the widget.
+        """
+
+        # layout the major elements of our widget
         layout = QtWidgets.QGridLayout()
-        layout.addWidget(self.table)
-        layout.addWidget(self.toolbar)
+        layout.setSpacing(get_dpi_scale()*5.0)
+        layout.addWidget(self._table_view)
+        layout.addWidget(self._toolbar)
 
-        # install layout
-        self.parent.setLayout(layout)
-
-    def update_model(self, db_coverage):
-        """
-        Passthrough to update underlying model.
-        """
-        self._model.update_model(db_coverage)
+        # apply the layout to the containing form
+        self._widget.setLayout(layout)
 
     #--------------------------------------------------------------------------
     # Signal Handlers
     #--------------------------------------------------------------------------
 
-    def _ui_entry_double_click(self, index):
+    def _ui_show_settings(self):
         """
-        Handle double click event on the coverage table view.
+        Handle a click of the settings button.
         """
+        delta = QtCore.QPoint(
+            -1*self._settings_menu.sizeHint().width(),
+            -1*self._settings_menu.sizeHint().height()
+        )
+        center = QtCore.QPoint(
+            self._settings_button.sizeHint().width()/2,
+            self._settings_button.sizeHint().height()/2
+        )
+        where = self._settings_button.mapToGlobal(center+delta)
+        self._settings_menu.popup(where)
 
-        # a double click on the table view will jump the user to the clicked
-        # function in the disassembly view
-        try:
-            idaapi.jumpto(self._model.row2func[index.row()].address)
-        except KeyError as e:
-            pass
+    #--------------------------------------------------------------------------
+    # Refresh
+    #--------------------------------------------------------------------------
 
-    def _ui_hide_zero_toggle(self, checked):
+    @disassembler.execute_ui
+    def refresh(self):
         """
-        Handle state change of 'Hide 0% Coverage' checkbox.
+        Refresh the Coverage Overview.
         """
-        self._model.hide_zero_coverage(checked)
+        self._table_model.refresh()
+        self._shell.refresh()
+        self._combobox.refresh()
 
 #------------------------------------------------------------------------------
-# Painting
+# Qt Event Filter
 #------------------------------------------------------------------------------
 
-class GridDelegate(QtWidgets.QStyledItemDelegate):
-    """
-    Used solely to draw a grid in the CoverageOverview.
-    """
+debugger_docked = False
 
-    def __init__(self, parent=None):
-        super(GridDelegate, self).__init__(parent)
-        self.grid_color = QtGui.QColor(QtCore.Qt.black)
+class EventProxy(QtCore.QObject):
 
-    def paint(self, painter, option, index):
-        super(GridDelegate, self).paint(painter, option, index)
-        painter.save()
-        painter.setPen(self.grid_color)
-        painter.drawRect(option.rect)
-        painter.restore()
+    def __init__(self, target):
+        super(EventProxy, self).__init__()
+        self._target = target
 
+    def eventFilter(self, source, event):
+
+        #
+        # hook the destroy event of the coverage overview widget so that we can
+        # cleanup after ourselves in the interest of stability
+        #
+
+        if int(event.type()) == 16: # NOTE/COMPAT: QtCore.QEvent.Destroy not in IDA7?
+            self._target.terminate()
+
+        #
+        # this is an unknown event, but it seems to fire when the widget is
+        # being saved/restored by a QMainWidget. we use this to try and ensure
+        # the Coverage Overview stays docked when flipping between Reversing
+        # and Debugging states in IDA.
+        #
+        # See issue #16 on github for more information.
+        #
+
+        if int(event.type()) == 2002 and disassembler.NAME == "IDA":
+            import idaapi
+
+            #
+            # if the general registers IDA View exists, we make the assumption
+            # that the user has probably started debugging.
+            #
+
+            # NOTE / COMPAT:
+            if disassembler.USING_IDA7API:
+                debug_mode = bool(idaapi.find_widget("General registers"))
+            else:
+                debug_mode = bool(idaapi.find_tform("General registers"))
+
+            #
+            # if this is the first time the user has started debugging, dock
+            # the coverage overview in the debug QMainWidget workspace. its
+            # dock status / position should persist future debugger launches.
+            #
+
+            global debugger_docked
+            if debug_mode and not debugger_docked:
+                idaapi.set_dock_pos(self._target._title, "Structures", idaapi.DP_TAB)
+                debugger_docked = True
+
+        return False
